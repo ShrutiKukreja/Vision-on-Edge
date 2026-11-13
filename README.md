@@ -12,16 +12,16 @@
 
 - **Converting a model isn't enough. The pixels have to match too.** Changing only the image resize method moved detection scores by up to **0.15**. Only the resize that exactly matched the training pipeline passed **52 / 52** parity frames. Bilinear passed 18 / 52.
 - We wrote a **bit-exact Kotlin port** of the training-time preprocessing. On the phone, **0 of 786,432** input values differed from the laptop, and on-device outputs matched the laptop (IoU 1.000, score difference < 0.0001).
-- A 118 MB transformer detector (RF-DETR Small) ran at **~0.6 FPS** on a Snapdragon 730G. That result drove a split: a **lightweight CNN on the phone** for live guidance and **heavier models on the server** for the final decision.
-- **The server doesn't trust the phone.** It recomputes the capture gate from raw detections and runs a VLM over the full video, including a screen-recapture spoof check, before marking anything compliant.
+- A 118 MB transformer detector (RF-DETR Small) ran at **~0.6 FPS** on a Snapdragon 730G. That result drove a split: a **lightweight CNN classification model on the phone** for live guidance and **heavier models on the server** for the final decision.
+- **The server doesn't trust the phone.** It recomputes the capture gate from raw detections and runs a VLM over the captured gate frame, including a screen-recapture spoof check, before marking anything compliant.
 
 ---
 
 ## 1. The problem
 
-Field engineers carry out preventive maintenance at telecom tower sites, on the order of **2 lakh (200,000) site visits a month**. Each visit needs photo or video evidence of specific equipment, such as rectifier modules inside a power cabinet or surge protection devices. Today a small sample of that evidence is checked by hand.
+Field engineers carry out preventive maintenance at telecom tower sites, on the order of **2 lakh (200,000) site visits a month**. Each visit needs photo or video evidence of specific equipment, such as rectifier modules inside a power cabinet or surge protection devices. Today these evidences are checked by hand.
 
-The goal: **the phone confirms that the right equipment was properly captured while the engineer is still on site, and the system decides afterwards whether the evidence can be trusted.**
+The goal: **the phone confirms that the right equipment was properly captured while the engineer is still on site, and the system decides afterwards whether the proof of work can be trusted.**
 
 ### Constraints
 
@@ -33,6 +33,8 @@ The goal: **the phone confirms that the right equipment was properly captured wh
 | Licensing | Permissive licences only (no AGPL, no paid licences) |
 | Hardware | Must run on any CPU, GPU or NPU on non-Apple Android devices |
 | Adversaries | Some users may try to game the system (old footage, filming a screen) |
+| Data privacy | Site data stays in India (data residency); no third-party provider may train on or retain our videos, frames or prompts |
+
 
 ---
 
