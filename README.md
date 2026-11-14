@@ -35,7 +35,6 @@ The goal: **the phone confirms that the right equipment was properly captured wh
 | Adversaries | Some users may try to game the system (old footage, filming a screen) |
 | Data privacy | Site data stays in India (data residency); no third-party provider may train on or retain our videos, frames or prompts |
 
-
 ---
 
 ## 2. Research questions
@@ -46,8 +45,6 @@ The goal: **the phone confirms that the right equipment was properly captured wh
 4. **Trust:** How do we keep a modified app or a spoofed video from producing a compliant result?
 
 ---
-
-## 3. System overview
 
 ## 3. System overview
 
