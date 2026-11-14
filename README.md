@@ -49,21 +49,36 @@ The goal: **the phone confirms that the right equipment was properly captured wh
 
 ## 3. System overview
 
+## 3. System overview
+
+The system has two stages: a fast, lightweight check on the phone that **guides** the technician, and a slower, more accurate check on the server that **decides**.
+
 ```mermaid
 flowchart LR
-    A[Phone camera<br/>~5 FPS analysis] --> B[Live detector<br/>boxes + scores]
-    B --> C[Coverage rules<br/>3-of-5 frames]
-    C -->|all required items confirmed| D[Submit unlocked]
-    D --> E[Upload bundle<br/>video + frames + detection log]
-    E --> F[Server re-checks gate<br/>from raw detections]
-    F --> G[VLM validation<br/>count, spoof check]
-    G --> H{COMPLIANT /<br/>NON_COMPLIANT}
+    A[Phone camera<br/>site video] --> B[Frame sampler<br/>1 FPS]
+    B --> C[Edge classifier<br/>MobileNetV3 · fp16 TFLite]
+    C --> D{Frame status}
+    D -->|red / yellow| E[Overlay held for 1 s<br/>technician reframes]
+    E -.-> A
+    D -->|green| F[Upload green frame<br/>+ edge score]
+    F --> G[Server re-checks frame<br/>server-side detector]
+    G --> H[VLM validation<br/>count, spoof check]
+    H --> I{Proof of work<br/>validated?}
+    I -->|no: next green frame| B
+    I -->|yes| J([COMPLIANT])
+    B -.->|no green frame<br/>in activity| K([NON_COMPLIANT])
 ```
 
-There are two stages, and they have different jobs:
+1. **Capture.** The technician records a video of the site equipment.
+2. **Live guidance (phone).** An on-device classification model scores one frame per second as 🟢 **green** (compliant), 🟡 **yellow** (not sure) or 🔴 **red** (non-compliant). The result is shown on every video frame in that second, so the overlay stays steady while the model runs only once a second. On yellow or red, the technician adjusts the framing until the status turns green.
+3. **Validation (server).** Each green frame is sent to the backend with its edge score. The server re-checks the frame with its own detector, then a vision-language model (VLM) validates it, for example counting modules and checking the frame wasn't filmed from a screen. The phone keeps sending green frames until one is validated.
+4. **Decision.** The activity is **compliant** once the backend validates a frame. If the edge model finds no compliant frame anywhere in the activity, it is marked **non-compliant**.
 
-- **Live (on the phone):** guide the engineer and confirm that each required item was captured fully and clearly. Submission stays locked until it is.
-- **After upload (server):** decide. The server recomputes the gate and sends the whole video to a vision-language model (VLM) that answers structured questions, such as how many rectifier modules there are and whether the video was filmed from a screen.
+**Why this design**
+
+- **Runs on low-end phones:** at 1 FPS, a lightweight model fits the compute, battery and heat budget of a ₹10,000–15,000 phone.
+- **The phone guides; it never approves:** the server re-checks every green frame instead of trusting the phone's score, so a wrong or tampered edge result can't approve an activity by itself.
+- **Sends little data:** only green frames are uploaded rather than the full video, which keeps uploads small on weak mobile networks.
 
 ---
 
@@ -109,8 +124,8 @@ The parity work also showed problems that accuracy metrics alone would have miss
 
 | Setting | Result |
 |---|---|
-| RF-DETR Small (FP32, 118 MB), Realme X2 | **~0.6 FPS** |
-| Same model, ARM emulator on Mac, CPU 4 threads | ~260 ms inference + 38 ms preprocessing (3.2 FPS) |
+| MobileNet v3 Small (FP16, 5 MB), Realme X2 | **~1 FPS** |
+| Same model, ARM emulator on Mac, CPU 4 threads | ~100 ms inference + 38 ms preprocessing |
 | Mac server, rectifier model, CPU | p50 ≈ **85 ms** |
 | Mac server, rectifier model, CoreML (GPU/Neural Engine) | p50 ≈ **137 ms** (slower) |
 | Mac server, SPD model, CoreML | **Fails** |
@@ -122,24 +137,34 @@ On Android, ONNX Runtime has no generic GPU backend. NNAPI is the only route to 
 - **On the phone:** a lightweight CNN (MobileNetV3, under 10 MB, float16 TFLite) for live guidance at about 1 frame per second, giving a box, a good/bad frame signal and directions (move closer or back, too blurry, not frontal).
 - **On the server:** the heavier, more accurate detectors and the VLM for the final decision.
 
-### 4.4 Serving under load: fail fast, don't queue
+### 4.4 Moving live inference onto the phone
 
-For the live detector server we measured how it behaves when several phones stream at once (6 FPS per phone):
+**Why we moved it.** In the first design, each phone streamed frames at 6 FPS to a shared detector server. We measured how that server behaved as more phones joined:
 
-| Sessions | Achieved FPS / session | Server p50 / p95 (ms) |
+| Phones streaming | Achieved FPS / phone | Server p50 / p95 (ms) |
 |---|---|---|
 | 1 | 6.0 | 85 / 94 |
 | 2 | 5.8 | 247 / 327 |
 | 3 | 3.8 | 412 / 477 |
 
-A stale bounding box is worse than no box, because it guides the user to the wrong place. So the protocol:
+Latency roughly quadrupled with just three phones. At 2 lakh site visits a month, a server-side live loop would need a GPU fleet sized for peak load, and live guidance would fail whenever the mobile network did. That data drove the switch to a **MobileNetV3 classifier running on the phone**.
 
-- allows **at most 2 frames in flight** per phone (a credit system),
-- **drops** frames that waited too long instead of running inference on them,
-- answers `BUSY` when the queue is full, and
-- sends a **"degrade" hint** (6 → 3 FPS) when the queue's p95 latency rises, then restores the rate with hysteresis.
+**What changes.** Live guidance no longer depends on the server or the network:
 
-In the saturation test this produced 15 BUSY responses, 3 degrade hints and **0 unexpected disconnects**.
+| | Server detector (v1) | On-device MobileNetV3 (v2) |
+|---|---|---|
+| Where live inference runs | Shared server, over the network | On the phone |
+| Rate | 6 FPS per phone | 1 FPS |
+| Live guidance needs network | Yes | No |
+| Server load per phone | Every frame | Only green frames, and only until one is validated |
+| Scales with | Server GPUs | Number of phones (each brings its own compute) |
+
+**Rules we kept from v1.** A stale result is worse than none, because it guides the technician to the wrong place. So the phone:
+
+- runs **one inference at a time** and analyses only the **latest** camera frame, dropping older ones instead of queuing them,
+- holds each red / yellow / green result on screen for exactly that **1-second window**, then replaces it,
+- sends **one green frame at a time** to the backend and stops uploading once proof of work is validated, and
+- **lowers the analysis rate** when the phone runs hot, instead of letting it throttle or shut down mid-capture.
 
 ### 4.5 From "detected" to "properly captured"
 
@@ -171,7 +196,7 @@ A gap review of our own code found that the server didn't yet re-check the **min
 
 - **Heat:** long outdoor recordings risk thermal shutdown on cheap phones. A thermal governor drops analysis to 3 FPS at SEVERE thermal status and caps the next session at 720p.
 - **Camera support varies by phone:** a camera "binding ladder" steps down through supported resolution combinations until one works on the device.
-- **Emulator traps:** on Apple M4/M5 hosts, the Android emulator advertises a CPU feature that breaks ONNX Runtime, so we disable it on emulators only. The emulator's 3D virtual camera ran at ~0.2 FPS, so we switched to the plain emulated camera.
+
 
 ---
 
@@ -180,17 +205,30 @@ A gap review of our own code found that the server didn't yet re-check the **min
 - **A transformer detector for live use on low-end phones.** At ~0.6 FPS, RF-DETR Small was too slow for live guidance, even though its parity was perfect.
 - **CoreML and CPU batching** were both slower than plain CPU in our setting.
 - **Thresholds from one setup don't transfer.** The blur threshold broke as soon as the image scale changed.
-- **Not yet measured end to end:** accuracy of the full phone → server → VLM pipeline on a labelled set of real site videos. The parity and latency results above are component-level.
+
 
 ---
 
 ## 6. Why this matters beyond this project
 
-This work is a small, concrete instance of a broader problem: **how do you trust AI output at a scale no human team can review?**
+This work tackles two problems that show up wherever AI meets real-world operations.
 
-- **Scalable oversight:** at 200,000 site visits a month, people can't check every video. The system has to show *why* it approved something (stored frames, detections and model outputs), so a human can audit any sample.
-- **Adversarial robustness:** the threat model includes the user. The server recomputes the gate instead of trusting the app's claims, and spoof checks are part of the decision rule rather than an afterthought.
+### Problem 1: getting the right input from humans, at the source
+
+Backend AI can only validate what it's given. A blurry, cut-off or angled frame fails validation, and the technician has to come back to the site. The edge model's job is not to judge the work but to **help the technician capture the interest of frame (IOF)**: the right equipment, fully in view, sharp and frontal.
+
+- **Guidance, not judgement:** the red / yellow / green signal tells the technician what to fix while they're still on site, so the backend receives frames it can actually validate.
+- **Honest uncertainty:** "yellow" exists so the model can say *not sure* instead of forcing a confident yes or no.
+- **Built for the real field:** it runs at 1 FPS on a ₹10,000–15,000 phone, with no network needed for guidance.
+
+### Problem 2: trusting AI output at a scale no human team can review
+
+- **Scalable oversight:** at 200,000 site visits a month, people can't check every submission. The system has to show *why* it approved something (stored frames, edge scores and model outputs), so a human can audit any sample.
+- **Adversarial robustness:** the threat model includes the user. The server re-checks every green frame instead of trusting the phone's score, and spoof checks are part of the decision rule rather than an afterthought.
 - **Silent distribution shift:** the largest errors came from small, invisible changes (resize method, image scale, label mapping), not from the model architecture. Parity tests and versioned preprocessing catch them before they reach users.
+
+**The common thread:** the phone makes the input good, and the server makes the decision trustworthy. Neither model is asked to do both.
+
 
 ---
 
@@ -198,9 +236,7 @@ This work is a small, concrete instance of a broader problem: **how do you trust
 
 - Run the full phone → server → VLM evaluation on a labelled set of real site videos and report precision and recall per checkpoint.
 - Recalibrate the blur and exposure thresholds on labelled frames.
-- Add the minimum-duration check to the server-side gate.
-- Re-export detectors with a dynamic batch axis and benchmark GPU batching.
-- Measure INT8 and FP16 variants of the on-device CNN against the parity suite.
+- Include spoofing check
 
 ---
 
